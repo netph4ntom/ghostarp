@@ -1080,7 +1080,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         info.add_row("MAC Spoofing", "[green]ENABLED[/] (Randomized on start)" if state.mac_spoof else "[dim]DISABLED[/]")
         info.add_row("DNS Spoofing", f"[yellow]{len(state.dns_spoof_map)}[/] domains active")
         
-        info_panel = Panel(info, title="[bold cyan]🔧 Configuration[/]", border_style="cyan", expand=True)
+        info_panel = Panel(info, title="[bold cyan] Configuration[/]", border_style="cyan", expand=True)
 
         # Targets Panel Left
         vt = Table(box=SIMPLE_HEAVY, header_style="bold yellow", expand=True)
@@ -1090,7 +1090,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         for v in state.victims:
             vt.add_row(v.ip, v.mac)
             
-        targets_title = f"[bold yellow]🎯 Selected Targets ({len(state.victims)})[/]"
+        targets_title = f"[bold yellow] Selected Targets ({len(state.victims)})[/]"
         targets_panel = Panel(
             vt if state.victims else Text("\n  Daftar target kosong.\n  Ketik 'add <ip_atau_nomor>' untuk menambahkan.", style="dim italic"), 
             title=targets_title, 
@@ -1116,7 +1116,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
                 status = "[dim]available[/]"
             ht.add_row(str(i + 1), ip, mac, status)
             
-        hosts_title = f"[bold green]🔍 Discovered Hosts ({len(hosts)})[/]"
+        hosts_title = f"[bold green] Discovered Hosts ({len(hosts)})[/]"
         if state.scanning:
             hosts_title += " [blink yellow](Scanning...)[/]"
             
@@ -1133,7 +1133,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         log_table.add_column("Action / Event")
         for ts, msg, style in log[-8:]:
             log_table.add_row(ts, f"[{style}]{msg}[/]")
-        log_panel = Panel(log_table, title="[bold magenta]📝 Configuration Logs[/]", border_style="magenta", expand=True)
+        log_panel = Panel(log_table, title="[bold magenta] Configuration Logs[/]", border_style="magenta", expand=True)
 
         # Layout grids
         top_grid = Table.grid(padding=(0, 1), expand=True)
@@ -1156,7 +1156,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         
         return Panel(
             Group(top_grid, log_panel, bar),
-            title="[bold cyan]⚡ GHOSTARP v1.5 - Setup Mode ⚡[/]",
+            title="[bold cyan] GHOSTARP v1.5 - Setup Mode [/]",
             subtitle=subtitle,
             border_style="cyan"
         )
@@ -1181,7 +1181,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         info.add_row("Poisoning", "[bold red]POISONING ACTIVE[/]" if not attack.paused else "[yellow]PAUSED[/]")
         info.add_row("Uptime", f"[white]{fmt_uptime(time.time() - state.start_time)}[/]")
         
-        info_panel = Panel(info, title="[bold red]💀 Attack Status[/]", border_style="red", expand=True)
+        info_panel = Panel(info, title="[bold red] Attack Status[/]", border_style="red", expand=True)
 
         stats = Table.grid(padding=(0, 2))
         stats.add_column(style="magenta bold")
@@ -1191,7 +1191,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         stats.add_row("HTTP Sniffed", f"[green]{len(http):,}[/]")
         stats.add_row("DNS Spoofed", f"[cyan]{len(attack.spoof_snapshot())}[/]")
         stats.add_row("Credentials Captured", f"[bold blink red]{creds}[/]")
-        stats_panel = Panel(stats, title="[bold magenta]📊 Statistics[/]", border_style="magenta", expand=True)
+        stats_panel = Panel(stats, title="[bold magenta] Statistics[/]", border_style="magenta", expand=True)
 
         vt = Table(box=SIMPLE_HEAVY, header_style="bold yellow", expand=True)
         vt.add_column("Target IP", style="bold yellow")
@@ -1199,7 +1199,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         vt.add_column("Packets Sent", justify="right")
         for v in victims:
             vt.add_row(v.ip, v.mac, f"{v.packets:,}")
-        targets_panel = Panel(vt, title="[bold yellow]🎯 Poisoned Victims[/]", border_style="yellow", expand=True)
+        targets_panel = Panel(vt, title="[bold yellow] Poisoned Victims[/]", border_style="yellow", expand=True)
 
         http_table = Table(box=SIMPLE_HEAVY, header_style="bold cyan", expand=True)
         http_table.add_column("Waktu", style="dim", width=8)
@@ -1211,14 +1211,14 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
             mstyle = "bold red" if method == "POST" else "green"
             http_table.add_row(ts, src, f"[{mstyle}]{method}[/]", url)
             
-        sniff_panel = Panel(http_table, title=f"[bold cyan]🌐 Live Intercepted Traffic (Sniff Ports: {attack.sniff_ports})[/]", border_style="cyan", expand=True)
+        sniff_panel = Panel(http_table, title=f"[bold cyan] Live Intercepted Traffic (Sniff Ports: {attack.sniff_ports})[/]", border_style="cyan", expand=True)
 
         log_table = Table(box=SIMPLE_HEAVY, header_style="bold green", expand=True)
         log_table.add_column("Waktu", style="dim", width=8)
         log_table.add_column("Event")
         for ts, msg, style in log[-8:]:
             log_table.add_row(ts, f"[{style}]{msg}[/]")
-        log_panel = Panel(log_table, title="[bold green]📝 Event Logs[/]", border_style="green", expand=True)
+        log_panel = Panel(log_table, title="[bold green] Event Logs[/]", border_style="green", expand=True)
 
         top_grid = Table.grid(padding=(0, 1), expand=True)
         top_grid.add_column(ratio=1)
@@ -1240,7 +1240,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         
         return Panel(
             Group(top_grid, sniff_panel, log_panel, bar),
-            title="[bold blink red]💀 GHOSTARP v1.5 - ATTACK ACTIVE 💀[/]",
+            title="[bold blink red] GHOSTARP v1.5 - ATTACK ACTIVE [/]",
             subtitle=subtitle,
             border_style="red"
         )
