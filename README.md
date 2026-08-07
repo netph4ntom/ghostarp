@@ -31,11 +31,39 @@ Pastikan sistem Anda sudah menginstal Python 3. Tool ini merekomendasikan sistem
 ## Penggunaan
 Tool ini harus dijalankan dengan hak akses root/administrator agar dapat memanipulasi lalu lintas jaringan.
 
-### Masuk ke Dashboard Interaktif (Setup Mode)
+### Masuk ke Dashboard Interaktif
 ```bash
 sudo python3 main.py
 ```
-*(Di dalam dashboard, Anda dapat mengetikkan perintah interaktif seperti `scan`, `add <ip>`, `mode mitm`, `dns add domain=ip`, lalu ketik `start` untuk melancarkan serangan)*
+
+Setelah masuk ke dalam dashboard, Anda dapat menggunakan perintah-perintah interaktif berikut untuk mengatur dan mengontrol serangan:
+
+#### Perintah Setup & Konfigurasi (Setup Mode)
+- `help` : Menampilkan menu bantuan.
+- `scan` : Memindai (ARP sweep) jaringan untuk mencari host/target yang aktif.
+- `add <ip>` atau `add <nomor>` : Menambahkan target berdasarkan IP atau nomor urut dari hasil scan. (Dapat menggunakan koma untuk multi-target, misal: `add 1,2,3` atau `add 192.168.1.10,192.168.1.11`).
+- `del <ip>` atau `del <nomor>` atau `del all` : Menghapus target dari daftar.
+- `set iface <nama_interface>` : Mengubah interface jaringan yang digunakan (misal: `set iface wlan0`).
+- `set gw <ip>` : Mengatur IP Gateway secara manual.
+- `set mode <mitm|kill>` : Mengubah mode serangan. `mitm` untuk sniffing (internet tetap jalan), `kill` untuk memutus koneksi internet korban.
+- `macspoof <on|off>` : Mengaktifkan atau menonaktifkan fitur MAC Spoofing (MAC akan diacak saat serangan dimulai).
+- `dns add <domain>=<ip>` : Menambahkan aturan DNS Spoofing (misal: `dns add facebook.com=192.168.1.100`).
+- `dns del <domain>` : Menghapus aturan DNS Spoofing.
+- `dns list` : Melihat daftar aturan DNS Spoofing yang aktif.
+- `start` : Memulai serangan berdasarkan konfigurasi dan target yang telah diatur.
+- `quit` atau `exit` : Keluar dari program.
+
+#### Perintah Kontrol (Saat Serangan Berlangsung / Attack Mode)
+Anda dapat mengubah parameter serangan secara dinamis (On-the-Fly) tanpa harus menghentikan tool:
+- `help` : Menampilkan menu bantuan saat serangan berlangsung.
+- `stop` : Menghentikan serangan, memulihkan ARP korban (restore), dan kembali ke Setup Mode.
+- `pause` : Menjeda pengiriman paket ARP poison (serangan dihentikan sementara tanpa menghapus target).
+- `resume` : Melanjutkan pengiriman paket ARP poison yang sedang dijeda.
+- `mode <mitm|kill>` : Mengubah mode serangan secara langsung saat berjalan.
+- `add <ip|nomor>` / `del <ip|nomor|all>` : Menambah atau menghapus target secara dinamis saat serangan berjalan. ARP cache target yang dihapus akan dipulihkan secara otomatis.
+- `dns add <domain>=<ip>` / `dns del <domain>` : Mengubah aturan DNS spoofing saat serangan berjalan.
+- `scan` : Melakukan pemindaian jaringan di latar belakang.
+- `quit` atau `exit` : Menghentikan serangan, memulihkan ARP secara otomatis, dan keluar dari program.
 
 ### Eksekusi Cepat via Argumen CLI
 Anda juga dapat langsung melewati tahap setup dan melancarkan serangan menggunakan argumen dari terminal:
