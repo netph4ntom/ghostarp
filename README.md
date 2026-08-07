@@ -1,74 +1,62 @@
-# GhostARP v1.5 - Interactive ARP Spoofing & MITM Framework
+# GhostARP
 
-GhostARP adalah tool pembungkus (wrapper) interaktif untuk ARP Spoofing, Man-in-the-Middle (MITM), dan Denial of Service (DoS) yang dirancang untuk pengujian keamanan jaringan. Tool ini kini dilengkapi dengan antarmuka **Interactive Dashboard** modern berbasis terminal menggunakan library `rich`.
+## Deskripsi
+GhostARP adalah tool (wrapper) untuk ARP Spoofing, Man-in-the-Middle (MITM), dan Denial of Service (DoS) yang dirancang untuk pengujian keamanan jaringan. Tool ini hadir dengan **Interactive Dashboard** berbasis terminal yang memudahkan kontrol serangan secara dinamis, serta mendukung eksekusi otomatis melalui antarmuka Command-Line (CLI).
 
----
-
-## Fitur Utama
-
-- **Direct Dashboard Boot**: Melewatkan input wizard CLI yang lambat. Program langsung masuk ke dashboard setup saat dijalankan.
-- **Setup & Attack Mode**: Dua antarmuka dinamis untuk fase konfigurasi (`SETUP`) dan fase penyerangan (`ATTACK ACTIVE`).
-- **Asynchronous Background Scanning**: Melakukan ARP sweep dan resolusi MAC gateway secara otomatis di background tanpa membekukan layar terminal.
-- **Easy Targeting (Index Selection)**: Menampilkan host aktif di jaringan dengan nomor indeks (misal `[1]`, `[2]`). Anda cukup mengetik `add 1` untuk menjadikannya target.
-- **Multi-target & Dynamic Control**: Tambah/hapus target, ubah mode, atau pause/resume serangan langsung di tengah proses penyerangan tanpa me-restart program.
+## Fitur
 - **Dua Mode Utama**:
-  - **MITM**: Meneruskan paket internet korban sambil melakukan sniffing data HTTP (termasuk deteksi kredensial) & DNS.
-  - **KILL**: Memutus total koneksi internet korban (ARP poisoning tanpa IP forwarding).
-- **Auto ARP Restoration**: Mengembalikan cache ARP semua target & gateway secara otomatis saat keluar (`Ctrl+C` / `quit`) atau ketika target dihapus.
-- **Cross-Platform Compatibility**: Handler terminal raw-mode dan input perintah didesain agar dapat dijalankan dan diuji di Windows maupun Linux.
+  - **MITM**: Meneruskan lalu lintas korban (IP Forwarding) sambil menyadap (sniffing) request HTTP (termasuk kredensial), TLS SNI (domain HTTPS), dan query DNS.
+  - **KILL**: Memutus total koneksi internet korban menggunakan ARP poison.
+- **Interactive Dashboard**: Antarmuka terminal interaktif dengan library `rich` untuk melihat status, log, daftar host aktif, kredensial yang didapat, dan query DNS secara real-time.
+- **Dynamic Control**: Tambah/hapus target, jeda/lanjutkan serangan, ubah peta spoofing DNS, atau ganti mode serangan (`mitm`/`kill`) saat serangan sedang berlangsung.
+- **Auto-Discovery & Validation**: Pemindaian ARP jaringan (ARP sweep) dan resolusi MAC gateway yang berjalan asinkron di latar belakang.
+- **DNS Spoofing**: Memanipulasi respons DNS untuk mengalihkan domain tertentu ke IP yang diinginkan.
+- **Auto ARP Restoration**: Memulihkan cache ARP korban dan gateway secara otomatis dan bersih setelah serangan dihentikan untuk mencegah kerusakan jaringan yang persisten.
+- **MAC Spoofing**: Fitur pengacakan alamat MAC untuk menyembunyikan identitas antarmuka jaringan penyerang.
 
----
+## Instalasi
+Pastikan sistem Anda sudah menginstal Python 3. Tool ini merekomendasikan sistem operasi Linux karena membutuhkan kapabilitas manipulasi paket tingkat rendah.
 
-## Kebutuhan & Instalasi
+1. Install dependensi :
+   ```bash
+   sudo apt update
+   sudo apt install python3-scapy python3-rich
+   ```
 
-Pastikan Anda memiliki hak akses root/administrator saat menjalankan serangan paket.
+2. Atau melalui `pip` menggunakan file `requirements.txt`:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-### 1. Install Dependensi
-Gunakan berkas `requirements.txt` untuk menginstal dependensi:
-```bash
-pip install -r requirements.txt
-```
-*Catatan: Dependensi utama adalah `scapy` dan `rich`.*
+## Penggunaan
+Tool ini harus dijalankan dengan hak akses root/administrator agar dapat memanipulasi lalu lintas jaringan.
 
-### 2. Jalankan Program
+### Masuk ke Dashboard Interaktif (Setup Mode)
 ```bash
 sudo python3 main.py
 ```
----
+*(Di dalam dashboard, Anda dapat mengetikkan perintah interaktif seperti `scan`, `add <ip>`, `mode mitm`, `dns add domain=ip`, lalu ketik `start` untuk melancarkan serangan)*
 
-## Panduan Perintah Interaktif
+### Eksekusi Cepat via Argumen CLI
+Anda juga dapat langsung melewati tahap setup dan melancarkan serangan menggunakan argumen dari terminal:
 
-Ketik perintah-perintah berikut di baris perintah bawah layar dashboard:
+```bash
+# Menyerang target tertentu dengan mode KILL (memutus koneksi internet korban)
+sudo python3 main.py -t 192.168.1.5 --mode kill
 
-### A. Perintah pada Setup Mode (`Setup Config >`)
-| Perintah | Deskripsi |
-| --- | --- |
-| `set iface <nama>` | Mengganti network interface aktif (misal `eth0` / `wlan0`). |
-| `set gw <ip>` | Mengganti IP default gateway. |
-| `set mode <mitm\|kill>` | Menentukan mode serangan (MITM atau KILL). |
-| `macspoof <on\|off>` | Mengaktifkan/menonaktifkan pengacakan MAC address interface. |
-| `dns add <domain>=<ip>` | Menambahkan peta spoofing DNS. |
-| `dns del <domain>` | Menghapus domain dari spoofing DNS. |
-| `dns list` | Menampilkan seluruh daftar DNS spoofing yang aktif. |
-| `add <ip\|nomor>` | Menambahkan target berdasarkan IP address atau nomor indeks host aktif. |
-| `del <ip\|nomor\|all>`| Menghapus target tertentu atau seluruh target. |
-| `scan` | Memulai ulang pemindaian host aktif di jaringan (ARP sweep). |
-| `start` / `run` | Memulai serangan ARP spoofing (pindah ke mode Attack). |
-| `quit` / `exit` | Keluar dari aplikasi. |
+# Menyerang beberapa target sekaligus dari file dengan mode MITM (sniffing) dan DNS spoofing
+sudo python3 main.py --targets-file victims.txt --mode mitm --dns-file dns.txt
 
-### B. Perintah pada Attack Mode (`Attack Active >`)
-| Perintah | Deskripsi |
-| --- | --- |
-| `stop` | Menghentikan serangan, memulihkan tabel ARP korban, dan kembali ke Setup Mode. |
-| `pause` | Menjeda pengiriman paket poison ARP (korban tetap di daftar target). |
-| `resume` | Melanjutkan kembali pengiriman paket poison ARP. |
-| `mode <mitm\|kill>` | Mengubah mode serangan di tengah jalan (runtime). |
-| `add <ip>` | Menambahkan korban baru secara dinamis saat serangan berjalan. |
-| `del <ip>` | Menghapus korban secara dinamis (ARP korban tersebut langsung dipulihkan). |
-| `dns add <d=ip>` | Menambahkan entri DNS spoofing baru saat serangan berjalan. |
-| `quit` / `exit` | Menghentikan serangan, memulihkan tabel ARP, dan menutup aplikasi secara bersih. |
+# Menyerang target spesifik dengan MAC Spoofing aktif pada antarmuka wlan0
+sudo python3 main.py -i wlan0 -t 192.168.1.10 --mac-spoof
+```
 
----
+Untuk melihat menu bantuan lengkap:
+```bash
+python3 main.py --help
+```
 
-## Penafian (Disclaimer)
-Tool ini dibuat khusus untuk keperluan edukasi, pengujian penetrasi resmi, dan audit keamanan jaringan yang dimiliki secara pribadi atau telah mendapatkan izin tertulis. Penyalahgunaan terhadap jaringan tanpa izin adalah ilegal dan melanggar hukum. Pengembang tidak bertanggung jawab atas segala kerusakan atau tuntutan hukum yang disebabkan oleh penggunaan tool ini.
+## Peringatan (Disclaimer)
+Tool ini dikembangkan **khusus untuk keperluan edukasi, riset, dan audit keamanan jaringan (penetration testing)** di jaringan milik Anda sendiri atau jaringan di mana Anda telah memiliki izin pengujian secara eksplisit.
+
+Segala bentuk penyalahgunaan tool ini untuk melakukan serangan pada jaringan pihak ketiga tanpa izin merupakan tindakan ilegal. Pengembang tidak bertanggung jawab atas segala kerusakan, gangguan layanan jaringan, pencurian data, atau tuntutan hukum yang timbul dari penyalahgunaan perangkat lunak ini. Gunakan dengan bijak dan bertanggung jawab.
